@@ -1,0 +1,165 @@
+---
+title: "Practical ML course project"
+author: "Monkey"
+date: 'Sep 2019'
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Data reading
+
+```{r data input,results='hide',message=FALSE,warning=FALSE,results='hide',}
+#setting working directory
+setwd("H:/BigOne/Root/R-Coursera/PracticalMachineLearinng/")
+Sys.setlocale("LC_ALL","English")
+if (!file.exists("pml-training.csv")){
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",
+              destfile ="pml-training.csv" )
+}
+if (!file.exists("pml-testing.csv")){
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",
+              destfile ="pml-testing.csv" )
+}
+training = read.csv("pml-training.csv",na.strings = c("NA","","#DIV/0!"))
+testing = read.csv("pml-testing.csv",na.strings = c("NA","","DIV/0!"))
+library(magrittr)
+library(data.table)
+library(ggplot2)
+library(GGally)
+library(caret)
+library(randomForest)
+training %>% str
+
+na.freq=function(x){
+  y=x %>% is.na %>% sum
+  y/length(x)
+}
+
+na_share=sapply(training, na.freq) 
+#seems like we have a bunch of variables with no or little data
+hist(na_share)
+#get rid off columns with lots of NAs
+subset_cols=names(training)[na_share<.5]
+trainDT=training[,c(subset_cols)]
+#net we will remove time and num window variables
+#because they may be used to guess activity but actualy has no pridictive out of sample value
+setDT(trainDT)
+#the num_window is actualy more of a factor variable or id variable for particular exercise / measurement
+trainDT=trainDT[,grep("time|window", names(trainDT)) := NULL]
+trainDT$X = NULL
+trainDT$user_name %<>% as.factor
+testing$user_name %<>% factor(levels = levels(trainDT$user_name))
+```
+
+##Data transformations
+After loading and looking through data we found that huge number of variables have no or almost no data. So we will build our model only on subset of varibles that where all observations are present. Also we will remove all variables with **time** or **window** in its name because they only give us information about observation sequence.
+
+##Exploratory analysis
+```{r correlations,results="hide",eval=F}
+#maybe we can see some group of variables
+numcols=which(sapply(trainDT, is.numeric))
+(cor(trainDT[,numcols,with=F])-diag(length(numcols))) %>% heatmap()
+#meehhh nothing interesting # not gonna do pca anyway
+```
+First we will explore how variables are distributed in different clases. Because we have `r length(trainDT)` of them we will take some semi-random set of variables.
+
+```{r exploratory all data}
+set.seed(1)
+exp_cols = names(trainDT)[c(2:3,sample(4:53,3),54)]
+exp_i = sample(nrow(trainDT),1000)
+#All data looks like that
+ggpairs(data=trainDT[exp_i,exp_cols,with=F],
+        mapping = aes(color=classe),
+        upper = list(continuous = wrap("density", alpha = 0.5), combo = "box_no_facet"),
+        lower = list(continuous = wrap("points", alpha = 0.3), combo = wrap("dot_no_facet", alpha = 0.2)))
+```  
+
+
+What we can see is that variables have multiple tops in density plots. What also we can see that at least variances of some variables differ between classes(ex. **pitch_belt** or **roll_belt**). Before thinking about model we will look on same plot only for one person. Probably some of varience in plots may be due different persons measurements. Lets look on Carlitos measurements.
+
+```{r exploratory carlitos}
+#we know that there are 6 persons so there is 19k/6
+exp_i_carlitos = sample(trainDT[,which(user_name=="carlitos")],1000)
+#what we can see is tha
+ggpairs(data=trainDT[exp_i_carlitos,exp_cols,with=F],
+        mapping = aes(color=classe),
+        upper = list(continuous = wrap("density", alpha = 0.5), combo = "box_no_facet"),
+        lower = list(continuous = wrap("points", alpha = 0.3), combo = wrap("dot_no_facet", alpha = 0.2)))
+
+```
+
+What we can see is that given subset of variables became more bell-shaped. Even though covarience matrices between groups don't appear the same. What we can do from here is to use decision trees(non parametic so more flexible) or quadratic linear discriminant analysis. For QDA rescaling variables on per person level may be a good idea.
+Lets look then on rescaled data.
+```{r scaling per person,warning=F}
+# ok now lets look if we can preprocess our data to metigate personal differences. 
+# we will standertize all variable on per persona levels
+# data frames below may by needed if we would predict testing data set
+means_proc = trainDT[,lapply(.SD, mean),by=user_name,.SDcols=-c("classe")]
+sd_proc = trainDT[,lapply(.SD, sd),by=user_name,.SDcols=-c("classe")]
+
+#but to scale variables in trainDT we won't use them
+cols=names(trainDT)[-c(1,54)]
+trainDT_scaled=copy(trainDT)
+for (j in names(trainDT_scaled) ){
+if (trainDT_scaled[[j]] %>% is.integer) set(trainDT_scaled, j =j,value = as.numeric(trainDT_scaled[[j]]))
+  }
+trainDT_scaled[,(cols):=lapply(.SD,function(x) as.vector(scale(x))),by=user_name,.SDcols = cols]
+
+#just in case check if scaling per person went ok
+#plot(trainDT_scaled$roll_belt,trainDT$roll_belt)
+
+#what we can see is that our scaling has made its job for given set of variables
+ggpairs(data=trainDT_scaled[exp_i,exp_cols,with=F],
+        mapping = aes(color=classe),
+        upper = list(continuous = wrap("density", alpha = 0.5), combo = "box_no_facet"),
+        lower = list(continuous = wrap("points", alpha = 0.3), combo = wrap("dot_no_facet", alpha = 0.2)))
+```  
+
+Even though scaling helped to some degree. It came with another problem. There is no measurements for Jeremy on several variables even though for other people there are plenty of data.
+```{r missing data}
+trainDT[user_name=="jeremy",.(roll_arm,pitch_arm,yaw_arm)] %>% summary()
+```
+So we will stick with decision trees as our approach and random forest(*RF*) in particular. Another good news is that we don't need data preprocessing for *RF*. One particular point about *RF* is that it uses OOB(out of bag) estimation for test errors. It makes cross validation unnecessary for this purpose. But we can use cross validation to pick better number of variables per tree.
+
+##Training the model
+```{r rf}
+train_index = createDataPartition(trainDT$classe,p=.6,list=F)
+trainingDT = trainDT[train_index,]
+trainingDT_scaled = trainDT_scaled[train_index,]
+#valDT here is actualy used as testing data. not confuse with another testing data size of 20.
+valDT = trainDT[-train_index,] 
+
+
+ctrl = trainControl(method = "cv", number = 5)
+mtryGrid=data.frame(mtry=c(2,4,10,20,30,50))
+
+if (!file.exists("fitRF100cv.rds")){
+  fitRF100cv = train(classe ~ .,data = trainingDT,
+                   method="rf",ntree=100,
+                   trainControl=ctrl,tuneGrid = mtryGrid)
+  saveRDS(fitRF100cv,"fitRF100cv.rds")
+} else {
+  fitRF100cv = readRDS("fitRF100cv.rds")
+}
+
+fitRF100cv$results
+```
+Now we can see that using cross validation having a Random Forest with 10 variables per tree give us slightly better accuracy.
+```{r RF test accuracy}
+fitRF100cv$finalModel
+
+confusionMatrix(predict(fitRF100cv,newdata = valDT),valDT$classe)
+
+```
+As has been said earlier *RF* uses OOB estimation for test error. The estimation in 0.8%. We can check if our model performs as well on validation set(or a testing set given the fact that it won't be used for anything else). The accuracy on validation set is 0.998. Our estimation of test error seems good.  
+As final tip we can watch which variables were most important.
+
+```{r variable importance}
+#improtance
+fitRF100cv$finalModel %>% varImpPlot()
+```
